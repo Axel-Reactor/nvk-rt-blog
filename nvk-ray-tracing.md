@@ -1,309 +1,338 @@
 ---
 title: "Reverse engineering NVIDIA ray tracing for NVK"
 author: Axel Gneiting
-date: 2026-10-17
+date: 2026-10-21
 ---
 
 # Reverse engineering NVIDIA ray tracing for NVK
 
-Our renderer uses ray tracing heavily, and the features it relies on are new
-ones: ray queries everywhere, cluster acceleration structures for streamed
-meshes, and large dynamic TLASes rebuilt every frame. Working that close to
-the edge, we kept running into bugs in NVIDIA's proprietary driver. Some were
-shader compiler bugs that miscompiled our traversal loops, and others were
-driver bugs we could only work around by guessing. The proprietary stack gave
-us no way to find out what was actually happening.
+Our renderer is built on ray tracing, and on the newest parts of it. It uses
+ray queries in almost every pass, cluster acceleration structures for the
+meshes we stream in, and large TLASes that get rebuilt every frame.
 
-We don't like guessing. When a frame is wrong, we want to step through every
-layer between our Rust code and the SASS the GPU runs: the Vulkan driver, the
-shader compiler, the acceleration structure builder, the command stream, and
-the bytes in the BVH. We are power users, and for us that means owning the
-whole stack so we can debug and fix any part of it.
+Very few people use these features as heavily as we do, and that means we
+find the bugs first.
+
+We kept hitting shader compiler bugs and other driver bugs. Each time we
+followed the same routine. We shrank the repro, filed a bug, and tried random
+changes to the shader until the problem went away. Then we told customers
+which driver version to install.
+
+We didn't like that routine.
+
+We write our engine in Rust. When a frame is wrong, we want to follow it all
+the way down: from the Rust code that records the command buffer, through the
+Vulkan driver and the shader compiler, to the SASS the GPU runs and the bytes
+of the BVH it traverses. We're power users, and we want to control the entire
+stack.
 
 NVK, the open source Vulkan driver for NVIDIA GPUs in Mesa, already gave us
-most of that, but it had no ray tracing. The data formats and instructions
-behind NVIDIA's RT cores are undocumented. This post describes how we
-reverse engineered them and what we built on top: ray queries, ray tracing
-pipelines, a GPU BVH builder, `VK_NV_cluster_acceleration_structure`, and a
-way to run NVK on NVIDIA's proprietary kernel module.
+most of that. It was missing ray tracing, which is the part we needed most.
+So we added it.
 
-## Decoding the BLAS format with an LLM
+## Why is this hard?
 
-A bottom-level acceleration structure (BLAS) is a blob of bytes that the
-driver writes and the RT core reads. NVIDIA doesn't document its layout, but
-the proprietary Vulkan driver will build one from any geometry you hand it,
-and nothing stops you from reading the result back.
+Ray tracing on NVIDIA hardware involves two things that NVIDIA doesn't
+document:
 
-We built a small tool, `blas-inspector`, for exactly that. It is a headless
-Vulkan program that:
+1. **The acceleration structure format.** A BLAS is a blob of bytes that the
+   driver writes and the RT core reads. To build one ourselves, we need to know
+   every bit of it.
+2. **The instructions.** A shader has to tell the RT core "traverse this BVH
+   with this ray, and give me the next thing you hit." Those instructions
+   don't appear in any public ISA document, and `nvdisasm` doesn't even have
+   mnemonics for them.
 
-1. zero-fills a device-local buffer,
-2. builds a BLAS into it from a few triangles,
-3. copies the buffer into host-visible memory with `vkCmdCopyBuffer`.
+Neither the Vulkan spec nor the CUDA docs cover them, and nobody upstream has
+reverse engineered them before. All we had was the proprietary driver, which
+does all of this correctly and lets us inspect what it does.
 
-The copy matters. Allocating the BLAS in host-visible memory might change how
-the driver lays it out, so we read back the real device-local bytes instead.
-Zeroing first means anything the driver didn't write reads as zero, so diffs
-between two builds stay clean.
+## Feed it triangles, read the bytes
 
-On top of that we added a GUI with a geometry editor on one side and a hex
-view on the other. You drag a vertex and watch which bytes change. Bytes that
-look like plausible `f32` values get highlighted. Later the tool grew a
-decoded view that draws the hierarchy back out of the bytes, so you can see
-our decoder's idea of the structure next to the input.
+The proprietary Vulkan driver builds a BLAS from whatever geometry you pass
+it, and nothing stops you from reading the result back afterwards.
 
-Most of the decoding was done with an LLM, Codex. The loop went like this:
-put a tiny, controlled piece of geometry into a real build, dump the bytes,
-and have the model form a hypothesis about the layout. Then write a script
-that nudges one coordinate, rebuilds, and checks which bits moved, and repeat.
-This kind of work suits an LLM well: it is tedious and depends on hypotheses,
-the model can generate and run probes far faster than a person can, and the
-hardware gives you ground truth on every attempt.
+So the first tool we wrote was `blas-inspector`. It's a headless Vulkan
+program that zero-fills a device-local buffer, builds a BLAS into it from a
+few triangles, and copies the result to host-visible memory. Zeroing first
+means any byte the driver didn't write reads as zero. We copy instead of
+allocating the BLAS in host-visible memory because we didn't want to change
+how the driver lays it out.
 
-The workflow was fast. The design spec for the inspector was written on the
-morning of July 20th, and the GUI was working by lunchtime. By that evening
-we had decoded the vertex compression and written a fully synthetic BLAS
-that the hardware traced correctly.
+On top of that we built a small GUI: a geometry editor on the left and a hex
+view on the right. When you drag a vertex, the bytes that changed light up,
+and anything that looks like a plausible `f32` gets highlighted.
 
-The method also produced wrong theories. For several hours the vertex
-coordinates looked "bit-coupled through a shared exponent", nonlinearly
-entangled and possibly not losslessly recoverable. The real answer was
-simpler: each vertex stores only the suffix of its raw float bits that differs
-from an anchor vertex, after dropping shared trailing zero bits. That one
-finding explained everything we had blamed on a shared exponent or entangled
-sign bits.
+<!-- TODO: screenshot of blas-inspector hex view -->
 
-Every decoded field was checked on the hardware. For example, we copied
-captured bytes into fresh acceleration structure storage without running a
-build, patched a primitive index from 0 to 42, traced a ray, and checked that
-the hardware reported 42.
+Then we pointed Codex at it.
 
-### What the format looks like
+Reverse engineering a binary format means proposing a hypothesis, building a
+probe for it, and checking the result, over and over. A human gets slow and
+careless doing that. An LLM doesn't get bored. It can come up with
+"coordinate X is stored at offset 0x24 with a shared exponent", write a script
+that moves one vertex by 0.002 and rebuilds, diff the output, and reject the
+hypothesis in less time than it takes you to read the hex dump. The hardware
+gives you ground truth on every iteration, so wrong guesses don't survive
+long.
 
-The structure on Blackwell (SM120) is a **12-wide BVH**. Ada (SM89) turned out
-to use the same format.
+It moved fast. On July 20th we wrote the design spec in the morning and had
+the GUI running by lunch. That evening the hardware was tracing a BLAS we had
+written entirely by hand.
 
-- **Nodes** are 128 bytes: a 32-byte header plus twelve 8-byte child slots.
-  - The header holds:
-    - a type byte,
-    - an FP32 origin,
-    - three 8-bit per-axis scale exponents,
-    - signed deltas to the parent and to the first child.
-  - Internal children are stored next to each other, so child *i* is
-    `parent + delta + i`.
-  - Every node knows its parent, so traversal can backtrack without a stack.
-    There is no traversal stack buffer anywhere.
-- **Child boxes** are quantized to one byte per plane, against a step of
-  `2^(e-135)`, and rounded outward.
-  - Byte 6 of a slot is `0xff` for an internal child, or the instance mask for
-    a TLAS leaf.
-  - Byte 7 is a leaf descriptor: a non-opaque bit, a triangle end index, and a
-    "block advance" that walks a cursor across the leaf's triangle storage.
-- **Triangles** live in 128-byte *triblocks* of up to 16 vertices.
-  - The first vertex is stored as raw FP32.
-  - The other vertices are a variable-width bitstream of differing suffixes,
-    which grows upward from the start of the block.
-  - Topology and per-triangle metadata grow downward from the end. Triangle 0
-    is implicitly `(0,1,2)`, and every other triangle is a 14-bit record of
-    three 4-bit local indices plus two flag bits.
-  - The last word is a codec descriptor that gives the bit widths.
-  - The compression is lossless, and dense meshes come out at around
-    15–24 bytes per triangle.
-- **Primitive and geometry indices** have several encodings:
-  - a direct encoding, in which a selector chooses how many bits go to the
-    primitive and how many to the geometry;
-  - an indirect encoding through a side table, which is needed past 65,536
-    geometries and for updatable builds.
-- **The root** has a separate 32-byte record with full-precision bounds. The
-  planes are padded, negated and "sign-folded", so a BLAS whose minimum is 0
-  stores it as `0x4b3fffff`. Read as a float, that is 12582911.0, which
-  confused us for a while.
-- **TLAS instances** live in 0x480-byte pages of 16 instances. Each page holds
-  parallel arrays of descriptors, BLAS addresses, transforms and SBT/custom
-  index pairs, plus a 64-byte leaf per instance that stores the inverse
-  transform.
+### False starts
 
-We also checked the format at its limits. We built BLASes and TLASes with
-16,777,215 primitives, placed a child node exactly 4 GiB away from its parent,
-and swept AABB metadata addresses across 128 GiB of sparse memory. That last
-sweep disproved an earlier "38-bit address" theory, which turned out to be
-caused by two bugs in our own code. All of this is written up in a LaTeX
-specification that is detailed enough to write an encoder from.
+The fast iteration also produced confident wrong answers.
 
-## Reverse engineering the RT core instructions
+For most of that first afternoon, the vertex coordinates looked
+"bit-coupled through a shared exponent". A commit message from that day says
+they were "not losslessly recoverable". That turned out to be wrong. Each
+vertex stores only the bits of its float that differ from an anchor vertex,
+after dropping the trailing zeros they share. Once we saw that, everything
+we'd blamed on a shared exponent or entangled sign bits made sense.
 
-Knowing the data format was only half of the problem. We still needed to know
-how a shader asks the RT core to traverse it.
+Later, the bounds of the root node came back as `0x4b3fffff` for a mesh whose
+minimum was 0. Read as a float that's 12582911.0, which matches nothing in the
+scene. It turned out the planes are padded, negated and "sign-folded" before
+they're stored.
 
-We started by compiling a set of small GLSL ray query probes, 84 in the end,
-through NVIDIA's offline toolchain and disassembling the result. That got us
-the instruction bytes, but `nvdisasm` prints the RT instructions as raw
-128-bit hex with no mnemonics. The names we use (`TTUOPEN`, `TTUST`, `TTUGO`,
-`TTULD`, `TTUMACROFUSE`) are our own.
+The best one was the sandbox. When the agent ran captures in a sandbox that
+couldn't see the NVIDIA GPU, Vulkan silently fell back to another device. That
+device produced a completely different and perfectly self-consistent BVH
+layout, with 56-byte binary nodes and 48-byte triangles. Nothing in the
+output said it came from the wrong GPU.
 
-The offline compiler's output didn't fully match what the driver really
-submits, so we went to the source. We wrote an `LD_PRELOAD` library that scans
-the proprietary driver's mmapped `/dev/nvidia*` regions for compute launch
-methods, follows the QMDs to the shader code heaps, and pulls out the exact
-code the GPU runs. This also killed one of our theories. NVK shaders using the
-new instructions were faulting with illegal instruction errors, and we had
-assumed some RT enable bit was missing from the launch state. The captures
-showed that QMDs with and without ray queries were byte-for-byte identical.
-The bug was in our instruction encoding.
+So the rule became that the hardware decides whether a field is decoded. In
+one test we copied captured bytes into fresh acceleration structure storage
+without running a build, changed a primitive index from 0 to 42, and traced a
+ray. The hardware reported 42.
 
-A traversal step turned out to be a fixed transaction:
+### What we found
+
+At a high level, Blackwell (and, as it turned out, Ada) uses a **12-wide
+BVH**:
+
+| Piece | Size | What's in it |
+|---|---|---|
+| Internal node | 128 B | an FP32 origin, a per-axis scale, parent and child offsets, and 12 child boxes quantized to 1 byte per plane |
+| Triblock | 128 B | up to 16 vertices, losslessly compressed against an anchor vertex, with triangle topology and IDs packed from the other end |
+| TLAS page | 0x480 B | 16 instances stored as parallel arrays of descriptors, BLAS pointers, transforms and SBT offsets |
+
+A few things surprised us:
+
+- **There's no traversal stack.** Every node stores an offset to its parent,
+  so the RT core can backtrack without one.
+- **Triangle compression is lossless.** Dense meshes come out at roughly 15
+  to 24 bytes per triangle with no loss of precision.
+- **IDs are packed adaptively.** Depending on how many geometries a BLAS has,
+  a 32-bit word is split differently between the primitive index and the
+  geometry index. Past 65,536 geometries, the IDs move to a side table.
+
+We also tested the format at its limits. We built BLASes with 16,777,215
+primitives, put a child node exactly 4 GiB away from its parent, and swept
+AABB metadata across 128 GiB of sparse memory. That last test disproved our
+"addresses are 38 bits" theory. The 38-bit limit had come from two bugs in
+our own code.
+
+Everything is written up in a LaTeX spec that's detailed enough to write an
+encoder from. (Ours is written from it.)
+
+## What does the shader actually do?
+
+A BVH the hardware can read is no use until a shader can ask the hardware to
+traverse it.
+
+We started by compiling 84 small GLSL ray query probes through NVIDIA's
+offline toolchain and disassembling them. That gave us instruction bytes, but
+as raw 128-bit hex with no names. The mnemonics we use (`TTUOPEN`, `TTUST`,
+`TTUGO`, `TTULD`) are our own.
+
+The offline compiler's output didn't quite match what the driver actually
+runs, so we went to the source. We wrote an `LD_PRELOAD` library that scans
+the proprietary driver's mmapped `/dev/nvidia*` regions for compute launches,
+follows them to the shader code heaps, and extracts the exact code the GPU is
+running.
+
+A traversal step turned out to be a small fixed transaction:
 
 ```
 TTUOPEN
-TTUMACROFUSE n
-TTUST   q[0x00]    ; control words (cull mask, flags, opacity)
-TTUST   q[0x04]    ; origin, tmin
-TTUST   q[0x05]    ; direction, tmax
-TTUST   q[0x08]    ; more control
-TTUST   q[0x10]    ; continuation state ...
-TTUST   q[0x18]    ; ... or the root pointer,
-TTUST   q[0x19]    ; ... selected per lane by predicates
-TTUST   q[0x20]
-TTUGO
-TTULD   q[0x38], q[0x3c], q[0x3d]   ; continuation state for the next step
-TTULD   q[0x30], q[0x31], q[0x32]   ; hit: barycentrics, t, triangle ref, SBT, instance
-TTULD.CLOSE
+TTUST  q[0x04]   ; origin, tmin
+TTUST  q[0x05]   ; direction, tmax
+TTUST  q[0x20]   ; BVH root (or saved state from the last step)
+...
+TTUGO            ; go
+TTULD  ...       ; state to resume from
+TTULD  ...       ; what we hit: t, barycentrics, triangle, instance
 ```
 
-The shader writes the ray and either the root or the saved continuation state
-into numbered slots, and starts traversal. The hardware then runs until it has
-something to report: a non-opaque candidate, a procedural AABB, or "done".
-Opaque hits are committed inside the RT core. The returned continuation state
-goes back into the next transaction, so `rayQueryProceedEXT` turns into a
-loop over transactions, and everything else in the ray query API is software
-that decodes the returned payload.
+You hand the RT core a ray and either a root pointer or the state left over
+from the previous step, and it runs until it has something to report. Opaque
+hits are handled entirely in hardware. Your shader only hears about
+non-opaque candidates, procedural boxes, and "done".
 
-Two details took a while to find:
+`rayQueryProceedEXT` becomes a loop over these transactions. Everything else
+in the ray query API is software that decodes what came back.
 
-- A nibble we had labeled `mode=N` was actually a **predicate selector**. An
-  exhaustive sweep of its values confirmed this.
-- The transaction must stay **atomic through the compiler**. Our first version
-  emitted it as separate instructions. Dead code elimination removed a
-  predicated-off `TTUST`, and register allocation reshuffled operands. Each
-  instruction was still valid on its own, but the hardware received a corrupt
-  cull mask. NAK now models the whole sequence as one virtual
-  `OpTtuOpBundle` instruction with 22 sources and 12 destinations, and only
-  expands it into real instructions after register allocation and scheduling.
+### Another false start
 
-## First light: ray queries on hand-built BLASes
+NVK's first shaders using these instructions died with illegal instruction
+faults.
 
-The first end-to-end test didn't use a driver-side builder at all. We got ray
-query shaders compiling in NAK, built BLASes **on the CPU** with the encoder
-from the reverse engineering work, uploaded them to plain buffers, and wrote
-their device addresses into a TLAS. On July 23rd, three days after the first
-byte dump, NVK rendered a glTF scene with ray queries.
+The theory was that we were missing some "RT enable" bit in the launch state,
+so the hardware didn't know to decode these opcodes. That was a reasonable
+guess, and it was wrong. The captures showed that the proprietary driver's
+launch descriptors with and without ray queries were byte-for-byte identical.
+The problem was in our encoding.
 
-This approach let us test the BVH format and the instruction encoding
-separately. When an image was wrong, we could rebuild the same BLAS with the
-proprietary driver and compare. Later, to separate a builder bug from a shader
-bug in mixed-opacity scenes, we did the reverse: the proprietary driver traced
-our NVK-built bytes and got identical results in all ten test cases, which
-pinned the bug on the shader side.
+The next one was harder to find. Every instruction in the transaction was
+correct, every value going into it was correct, and the hardware still saw a
+corrupt cull mask. The cause was the compiler. Dead code elimination had
+removed a predicated-off store, and register allocation had moved the
+remaining operands around. The hardware expects the sequence to be exactly
+what it is, so now our compiler, NAK, keeps the whole transaction as one
+opaque instruction until after register allocation and scheduling, and only
+then expands it.
 
-## A GPU BVH builder
+We also had a field labeled `mode=N` in our notes. An exhaustive sweep showed
+it was a predicate selector.
 
-CPU-built BLASes are fine for a test, but a real driver has to build
-acceleration structures on the GPU, every frame, for millions of triangles.
+## First light
 
-The NVK builder plugs into Mesa's common `vk_bvh` framework:
+The first end-to-end test didn't involve a driver-side BVH builder at all.
 
-1. The common LBVH/PLOC builders produce a binary intermediate tree.
-2. We **collapse** that tree top-down into 12-wide nodes, following an
-   SAH-optimal collapse plan that the common builders now emit.
-3. Each node is encoded by one subgroup, and triblocks are packed in
-   registers.
-4. Triangles that share an edge are paired before packing, and very large
-   triangles are split at coarse Morton planes to tighten their boxes.
+We got ray query shaders compiling in NAK, built BLASes **on the CPU** with
+the encoder from the reverse engineering work, uploaded them into ordinary
+buffers, and put their device addresses into a TLAS. The driver had no idea
+those buffers were acceleration structures.
 
-All builds in a `vkCmdBuildAccelerationStructuresKHR` call are batched into a
-single dispatch per stage over a job table. The GPU can write that table
-itself, which also gives us indirect builds. Small builds skip the full
-pipeline and are built inside a single workgroup.
+On July 23rd, three days after the first byte dump, NVK rendered a glTF scene
+with ray queries.
 
-## Ray tracing pipelines and passing the CTS
+<!-- TODO: first-light screenshot -->
 
-Once ray queries worked, pipelines followed. The first version used a
-continuation-style dispatcher. The current one makes each RT stage a native
-function: raygen, closest-hit, miss, any-hit and intersection shaders call
-each other with `CALL.ABS`/`RET.ABS` and a fixed register ABI, with arguments
-starting at R10. Payloads of up to 48 bytes are passed entirely in registers.
-On an RTX 4090 that took primary rays in our cluster LOD test from 188 µs to
-122 µs. The traversal shader is built on the same TTU transaction as ray
-queries. We also implemented indirect trace rays,
-`VK_KHR_ray_tracing_maintenance1` and `VK_KHR_ray_tracing_position_fetch`.
+Building the BLASes outside the driver meant we could test the format and the
+instruction encoding separately. When a frame was wrong, we could let the
+proprietary driver build the same BLAS and see whether the image changed. We
+also ran it the other way round: the proprietary driver traced BLASes NVK had
+built, matched our results in all ten mixed-opacity cases, and so the bug
+had to be in our shader code.
 
-The result is that NVK now passes the full Vulkan ray tracing CTS. For ray
-queries on an RTX 5090, a full `dEQP-VK.ray_query.*` run on CTS 1.4.7.0 gives
-**22,580 pass, 0 fail**. The 26,779 cases reported as NotSupported cover
-features we don't expose: host-side acceleration structure builds and opacity
-micromaps.
+## A real builder
 
-<!-- TODO: add dEQP-VK.ray_tracing_pipeline.* totals -->
+Hand-built BLASes are fine for a demo. A driver has to build them on the GPU,
+every frame, for millions of triangles.
 
-Getting there also meant a lot of compiler work, because RT shaders are hard
-on a compiler. Register allocation and spilling across calls, spilling to
-shared memory, uniform register propagation, and modelling the TTU's
-input/output allocation phases all came out of profiling traversal-heavy
-shaders.
+The NVK builder plugs into Mesa's common BVH framework, which RADV and others
+also use. The common code produces a binary tree. We collapse it into 12-wide
+nodes following an SAH-optimal plan, encode each node with one subgroup, and
+pack the triblocks in registers. Before packing, triangles that share an edge
+are paired up, and very large triangles are split so their boxes are tighter.
 
-## NVK on the proprietary kernel driver
+All builds in a single `vkCmdBuildAccelerationStructuresKHR` call are batched
+into one dispatch per stage. Small builds skip most of that and are built
+inside a single workgroup.
 
-NVK normally runs on nouveau, the open source kernel driver. Many machines,
-including our customers', run NVIDIA's kernel module instead, and asking
-people to change kernel drivers to use our renderer isn't realistic.
+This is where the CPU encoder earned its keep. It became the reference that
+every GPU-built BLAS was diffed against.
 
-So we added a second backend. When nouveau isn't available, NVK talks to the
-NVIDIA kernel module directly through its Resource Manager (RM) ioctl
-interface. It allocates a client, device and subdevice, a GPU virtual address
-space, a channel group and a GPFIFO channel with usermode doorbells, and
-synchronizes using RM semaphore surfaces. `nvidia-drm` handles dma-buf and
-sync_file interop.
+## Pipelines, and passing the CTS
 
-We matched the proprietary driver's memory behavior where it mattered for
-performance:
+Once ray queries worked, full ray tracing pipelines came next.
 
-- **2 MB pages** for large VRAM allocations. This took our water FFT from
-  1.09 ms to 0.80 ms. The proprietary driver takes 1.05 ms.
-- **Compression** for images in VRAM.
-- **Asynchronous copy engines** for transfers, chosen so they don't share the
-  graphics runlist.
+The first version used continuations: a dispatcher loop in the raygen shader
+jumping between stages. The current version is simpler and faster. Every RT
+stage is a native function that is called with real `CALL` and `RET`
+instructions and a fixed register ABI. Payloads of up to 48 bytes stay in
+registers for the whole trace. On an RTX 4090, that took primary rays in our
+cluster LOD test from **188 µs to 122 µs**.
 
-The RM ABI isn't stable, but in practice it changes slowly. The backend
-currently supports **every kernel module branch from 580 to 615**. Across that
-range the only ABI difference we have needed to handle is one new field in
-the channel allocation parameters in 610.
+Along the way we added indirect trace rays, `VK_KHR_ray_tracing_maintenance1`,
+and `VK_KHR_ray_tracing_position_fetch`.
 
-This helps our customers directly. We ship NVK with our application, so we no
-longer have to tell anyone to update their NVIDIA driver to pick up a fix: as
-long as the installed kernel module is in that range, they get our userspace
-driver with our fixes.
+Then we ran the CTS. On an RTX 5090, a full `dEQP-VK.ray_query.*` run:
 
-## Cluster acceleration structures
+```
+Pass:          22,580
+Fail:               0
+NotSupported:  26,779   (host-side builds, opacity micromaps)
+```
 
-Our renderer streams meshes at cluster granularity, so we also implemented
-`VK_NV_cluster_acceleration_structure`. A cluster acceleration structure
-(CLAS) has three parts:
+<!-- TODO: dEQP-VK.ray_tracing_pipeline.* totals -->
 
-- a small header,
-- a single leaf-only 12-wide node,
-- its triblocks.
+NVK now passes the full Vulkan ray tracing CTS.
 
-A CLAS contains no absolute addresses, so moving one in memory is a plain
-copy. That is what makes streaming cheap. Each cluster is built by a single
-subgroup, which Morton-sorts up to 256 triangles and runs a small dynamic
-program to choose the slot ranges with the lowest SAH cost. Cluster BLASes
-then reference cluster triblocks by address. All cluster operations size
-their dispatches on the GPU, so the CPU never has to read back counts.
+Some CTS passes don't mean much. `object_behind_bounding_boxes` happily
+reports `Pass` when both the reference image and the result are empty,
+because two empty images compare equal. We learned to look at the images and
+not just the verdict.
 
-## What's next
+RT shaders also put a lot of pressure on the compiler. Many of the NAK
+changes on this branch came from profiling traversal-heavy shaders: spilling
+around calls, spilling to shared memory instead of local memory, and better
+use of uniform registers. Shared-memory spills alone took one of our test
+scenes from 6.2 ms to 5.7 ms.
 
-<!-- TODO: upstreaming plans, links to the BVH spec, blas-inspector, and the Mesa branch -->
+## Running on NVIDIA's kernel driver
 
-Ray tracing is no longer a black box for us. When something breaks, we can
-follow it from the Rust code that records the command buffer down to the bits
-of a triblock, and fix it at whichever layer it's in.
+NVK normally runs on nouveau, the open source kernel driver.
+
+Our customers don't. They run NVIDIA's kernel module, and "please switch your
+kernel driver" isn't something we can ask them to do.
+
+So NVK now has a second backend. If nouveau isn't there, NVK talks directly to
+NVIDIA's kernel module through its Resource Manager ioctls. It allocates its
+own GPU address space and channels, submits work through usermode doorbells,
+and synchronizes using RM semaphores. The proprietary userspace driver isn't
+involved at all.
+
+We copied what the proprietary driver does wherever it affected performance:
+
+- **2 MB pages** for large allocations took our water FFT from 1.09 ms to
+  0.80 ms. The proprietary driver takes 1.05 ms.
+- **Compression** for images in VRAM. We tried compressing buffers too, but
+  it made acceleration structures slower, so we turned that off.
+- **Async copy engines** for transfers, choosing ones that don't share the
+  graphics queue.
+
+The RM interface isn't a stable ABI, but in practice it changes slowly. Right
+now we support every kernel module branch from **580 to 615**. Across that
+whole range we've needed exactly one ABI special case, a new field in channel
+allocation that arrived in 610.
+
+This turned out to be one of the most useful parts of the project. We ship the
+driver with our application, so a driver bug fix ships to customers as part
+of our next release. We no longer ask anyone to update their NVIDIA driver.
+
+## Clusters
+
+We stream meshes in clusters, so we also implemented
+`VK_NV_cluster_acceleration_structure`.
+
+A cluster acceleration structure is a small header, a single 12-wide leaf
+node, and its triblocks. It contains no absolute pointers, so moving a
+cluster to a new place in memory is a plain `memcpy`, and that's what makes
+streaming cheap.
+
+Each cluster is built by one subgroup. The subgroup Morton-sorts up to 256
+triangles and runs a small dynamic program to decide how to split them across
+the 12 slots. Cluster BLASes then point at cluster triblocks directly. Every
+cluster operation sizes its own dispatch on the GPU, so the CPU never waits on
+a readback.
+
+## Where this leaves us
+
+| | |
+|---|---|
+| First byte dump | July 20 |
+| First ray query frame on NVK | July 23 |
+| `blas-inspector` commits | 127 |
+| Mesa commits on the branch | 139 |
+| GPUs | Ada (SM89), Blackwell (SM120) |
+| Kernel module branches | 580–615 |
+| Ray query CTS failures | 0 |
+
+<!-- TODO: links to the BVH spec, blas-inspector, and the Mesa branch; upstreaming plans -->
+
+The next time a ray tracing bug costs us a day, it'll be our bug, in code we
+can read, and we can fix it and ship the fix in our next release.
