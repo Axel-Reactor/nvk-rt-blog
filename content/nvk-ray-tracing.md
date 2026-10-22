@@ -104,7 +104,7 @@ killed a theory that addresses were 38 bits wide. The 38-bit limit turned
 out to be two bugs in our own code.
 
 All of it is written down in a spec detailed enough to build an encoder
-from. We know that because ours was written from it.
+from.
 
 ## The ray tracing instructions
 
@@ -215,7 +215,7 @@ function that the other stages call directly. Our mesh streaming works in
 clusters, so we also implemented `VK_NV_cluster_acceleration_structure`.
 
 Ray tracing pipelines are what most games use, which meant we could test
-with the classic: Quake II RTX, path traced, on an open source driver.
+with the classic, Quake II RTX, path traced on an open source driver:
 
 ![Quake II RTX running on NVK with ray tracing pipelines](/images/nvk-quake2-rtx.png)
 
@@ -293,7 +293,7 @@ This is what that looks like in practice. Our shaders are written in Rust,
 and with NVK we can see the SASS for each line, with the Rust source
 interleaved: the texture fetch, the FFMAs the gradient turned into, and the
 reconvergence point of that `if`, each one next to the line that produced
-it. That is what we wanted all along.
+it.
 
 ![SASS output from NAK for one of our Rust shaders, with the original Rust source interleaved line by line](/images/nvk-rust-to-sass.png)
 
