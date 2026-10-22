@@ -69,10 +69,13 @@ pre code { background: none; padding: 0; }
 
 blockquote {
   margin: 1.5rem 0;
-  padding: 0.25rem 1.25rem;
+  padding: 0 1.25rem;
   border-left: 3px solid var(--accent);
   color: var(--muted);
 }
+
+blockquote p { margin: 0; }
+blockquote p + p { margin-top: 0.75rem; }
 
 table {
   border-collapse: collapse;
