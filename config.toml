@@ -1,0 +1,6 @@
+base_url = "https://zeromatter.example"
+title = "Zeromatter Blog"
+compile_sass = false
+build_search_index = false
+
+[markdown]
