@@ -142,6 +142,12 @@ passes the full ray tracing CTS.
 
 <!-- TODO: CTS numbers for ray_query and ray_tracing_pipeline -->
 
+Passing the CTS is one thing. The real test was our own renderer, Hydrogen,
+which uses every one of the extensions this post is about at once. Here it
+is running on NVK for the first time, on an RTX 4090:
+
+![Zeromatter's Hydrogen renderer running on NVK on an RTX 4090](/images/nvk-hydrogen-first-run.png)
+
 ## Running on NVIDIA's kernel driver
 
 Fixing bugs ourselves only helps if the fixes reach our customers without
@@ -155,9 +161,27 @@ talks to the kernel module directly and uses none of NVIDIA's userspace
 driver. The kernel interface isn't officially stable, but it changes slowly,
 and we currently support every kernel driver release from 580 to 615.
 
+A nice side effect is that both drivers can run on the same machine at the
+same time, on the same kernel module. Here is the same Vulkan sample running
+on NVIDIA's driver on the left and on NVK on the right. Performance was far
+from final at that point; the first version didn't yet use large pages or
+memory compression, and most of the compiler work hadn't happened.
+
+![The Vulkan instancing sample running side by side on NVIDIA's proprietary driver and on NVK, both on the same RTX 4090 and the same NVIDIA kernel module](/images/nvk-nvrm-side-by-side.png)
+
 That decouples us from our customers' driver updates. We ship NVK with our
 application, so a driver fix now goes out with our next release and works
 with whatever NVIDIA driver is already installed.
+
+## What's left to do
+
+We're not quite at NVIDIA's performance yet. The acceleration structures and
+the traversal itself are on par, since the hardware does the same work either
+way. The gap is in the shader compiler. NVIDIA's compiler has had years of
+tuning on exactly the kind of long, register-hungry shaders that ray tracing
+produces, and NAK is still catching up on register allocation, spilling and
+scheduling around the traversal calls. This is where most of our effort goes
+now, and the gap has been closing with every round of compiler work.
 
 ## Where we are now
 
