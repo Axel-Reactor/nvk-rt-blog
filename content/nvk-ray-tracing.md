@@ -127,23 +127,23 @@ the mnemonics ROT13-encoded, and someone had already
 NVIDIA's own:
 
 ```
-TTUOPEN
-TTUMACROFUSE 15
-TTUST  q[0x00], control
-TTUST  q[0x04], origin, tmin
-TTUST  q[0x05], direction, tmax
-TTUST  q[0x08], control
-TTUST  q[0x10], continuation      ; state from the last step ...
-TTUST  q[0x18], continuation
-TTUST  q[0x19], continuation
-TTUST  q[0x20], root              ; ... or the BVH root
-TTUGO
-TTULD  q[0x38]                    ; where to resume
-TTULD  q[0x3c]
-TTULD  q[0x3d]
-TTULD  q[0x32]                    ; what we hit: instance, SBT offset
-TTULD  q[0x31]                    ; triangle block address
-TTULD.CLOSE q[0x30]               ; t, barycentrics, triangle
+TTUOPEN                      ; open a transaction with the RT unit
+TTUMACROFUSE 15              ; the next 15 instructions are one packet
+TTUST  q[0x00], control      ; ray flags, cull mask, face culling
+TTUST  q[0x04], origin, tmin ; ray origin and tmin
+TTUST  q[0x05], dir, tmax    ; ray direction and tmax
+TTUST  q[0x08], control      ; opacity flags, skip triangles / AABBs
+TTUST  q[0x10], state        ; resuming: traversal state, part 1 of 3
+TTUST  q[0x18], state        ; resuming: traversal state, part 2 of 3
+TTUST  q[0x19], state        ; resuming: traversal state, part 3 of 3
+TTUST  q[0x20], root         ; first step: the BVH root
+TTUGO                        ; start traversing
+TTULD  q[0x38]               ; traversal state for the next step, part 1 of 3
+TTULD  q[0x3c]               ; traversal state for the next step, part 2 of 3
+TTULD  q[0x3d]               ; traversal state for the next step, part 3 of 3
+TTULD  q[0x32]               ; instance index and SBT offset
+TTULD  q[0x31]               ; address of the triangle block that was hit
+TTULD.CLOSE q[0x30]          ; t, barycentrics, triangle; ends the transaction
 ```
 
 The shader writes the ray and either the BVH root or the state left over
@@ -193,7 +193,7 @@ see the artifacts: a few triangles are missing, and some edges have
 speckles where the shader decoded a hit wrong. But it's a shaderball, lit by
 ray queries, running on an open source driver.
 
-![The first ray traced image out of NVK on July 23rd: a shaderball lit with ray queries, traced against a BLAS built on the CPU by our own encoder, rendering artifacts included](/images/nvk-first-light-shaderball.png)
+![The first ray traced image out of NVK on July 23rd: a shaderball lit with ray queries, traced against a BLAS built on the CPU by our own encoder, rendering artifacts included](/images/nvk-first-light-shaderball.webp)
 
 It also kept the problem small. Whenever an image was wrong, we could have
 the proprietary driver build the same BLAS and see whether that fixed it,
@@ -208,7 +208,7 @@ that into 12-wide nodes and encodes the compressed triangle blocks. Once the
 driver could build acceleration structures itself, existing Vulkan software
 started working unmodified. Sascha Willems' ray query sample was the first:
 
-![Sascha Willems' ray traced shadows sample running on NVK on an RTX 5090 laptop GPU](/images/nvk-sascha-willems-ray-queries.png)
+![Sascha Willems' ray traced shadows sample running on NVK on an RTX 5090 laptop GPU](/images/nvk-sascha-willems-ray-queries.webp)
 
 Ray tracing pipelines followed, with each shader stage compiled as a real
 function that the other stages call directly. Our mesh streaming works in
@@ -217,7 +217,7 @@ clusters, so we also implemented `VK_NV_cluster_acceleration_structure`.
 Ray tracing pipelines are what most games use, which meant we could test
 with the classic, Quake II RTX, path traced on an open source driver:
 
-![Quake II RTX running on NVK with ray tracing pipelines](/images/nvk-quake2-rtx.png)
+![Quake II RTX running on NVK with ray tracing pipelines](/images/nvk-quake2-rtx.webp)
 
 Then we ran the Vulkan CTS until there was nothing left to fix. The full ray
 query suite on an RTX 5090:
@@ -238,7 +238,7 @@ Passing the CTS is one thing. The real test was our own renderer, Hydrogen,
 which uses every one of the extensions this post is about at once. Here it
 is running on NVK for the first time, on an RTX 4090:
 
-![Zeromatter's Hydrogen renderer running on NVK on an RTX 4090](/images/nvk-hydrogen-first-run.png)
+![Zeromatter's Hydrogen renderer running on NVK on an RTX 4090](/images/nvk-hydrogen-first-run.webp)
 
 ## Running on NVIDIA's kernel driver
 
@@ -261,7 +261,7 @@ on NVIDIA's driver on the left and on NVK on the right. Performance was far
 from final at that point; the first version didn't yet use large pages or
 memory compression, and most of the compiler work hadn't happened.
 
-![The Vulkan instancing sample running side by side on NVIDIA's proprietary driver and on NVK, both on the same RTX 4090 and the same NVIDIA kernel module](/images/nvk-nvrm-side-by-side.png)
+![The Vulkan instancing sample running side by side on NVIDIA's proprietary driver and on NVK, both on the same RTX 4090 and the same NVIDIA kernel module](/images/nvk-nvrm-side-by-side.webp)
 
 That decouples us from our customers' driver updates. We ship NVK with our
 application, so a driver fix now goes out with our next release and works
@@ -295,6 +295,6 @@ interleaved: the texture fetch, the FFMAs the gradient turned into, and the
 reconvergence point of that `if`, each one next to the line that produced
 it.
 
-![SASS output from NAK for one of our Rust shaders, with the original Rust source interleaved line by line](/images/nvk-rust-to-sass.png)
+![SASS output from NAK for one of our Rust shaders, with the original Rust source interleaved line by line](/images/nvk-rust-to-sass.webp)
 
 <!-- TODO: links -->
